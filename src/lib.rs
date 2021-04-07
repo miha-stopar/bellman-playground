@@ -5,3 +5,4 @@ mod merkle;
 mod preimage;
 mod sss;
 mod rln;
+mod attr;
