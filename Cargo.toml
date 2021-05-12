@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 rand = "0.4"
+byteorder = "1"
 
 bellman = { package = "bellman_ce", version = "0.3.1"}
 pairing = { package = "pairing_ce", version = "0.19.0"}

@@ -1,32 +1,44 @@
+use bellman::pairing::ff::PrimeField;
+use bellman::pairing::ff::PrimeFieldRepr;
 use bellman::{Circuit, ConstraintSystem, SynthesisError};
-use sapling_crypto::circuit::{boolean, ecc, num};
 use sapling_crypto::jubjub::{
-    edwards, FixedGenerators, JubjubEngine, PrimeOrder,
+    edwards, FixedGenerators, JubjubEngine, PrimeOrder, Unknown,
+};
+use sapling_crypto::{alt_babyjubjub::JubjubParams, eddsa};
+use sapling_crypto::{
+    circuit::{boolean, ecc, num},
+    eddsa::{PublicKey, Signature},
 };
 
-pub struct DLSnark<'a, E: JubjubEngine> {
+pub struct FESnark<'a, E: JubjubEngine> {
     pub params: &'a E::Params,
     pub x: Option<E::Fs>,
     pub r: Option<E::Fs>,
     pub pub_key: Option<edwards::Point<E, PrimeOrder>>,
     pub enc_rand: Option<edwards::Point<E, PrimeOrder>>,
     pub enc: Option<edwards::Point<E, PrimeOrder>>,
+    pub sig: Option<Signature<E>>,
+    pub sig_pub_key: Option<PublicKey<E>>,
+    pub sig_pub_key_pt: Option<edwards::Point<E, Unknown>>,
 }
 
-impl<'a, E: JubjubEngine + 'a> Clone for DLSnark<'a, E> {
+impl<'a, E: JubjubEngine + 'a> Clone for FESnark<'a, E> {
     fn clone(&self) -> Self {
-        DLSnark {
+        FESnark {
             params: self.params,
             x: self.x.clone(),
             r: self.r.clone(),
             pub_key: self.pub_key.clone(),   // sG
             enc_rand: self.enc_rand.clone(), // rG
             enc: self.enc.clone(),           // xG + r(sG)
+            sig: self.sig.clone(),
+            sig_pub_key: self.sig_pub_key.clone(),
+            sig_pub_key_pt: self.sig_pub_key_pt.clone(),
         }
     }
 }
 
-impl<'a, E: JubjubEngine> Circuit<E> for DLSnark<'a, E> {
+impl<'a, E: JubjubEngine> Circuit<E> for FESnark<'a, E> {
     fn synthesize<CS: ConstraintSystem<E>>(
         self,
         cs: &mut CS,
@@ -126,6 +138,56 @@ impl<'a, E: JubjubEngine> Circuit<E> for DLSnark<'a, E> {
             &xy1_eq,
             &boolean::Boolean::constant(true),
         )?;
+
+        let mut sigs_bytes = [0u8; 32];
+        let sigs_bytes = match self.sig {
+            Some(ref value) => {
+                value
+                    .s
+                    .into_repr()
+                    .write_le(&mut sigs_bytes[..])
+                    .expect("get LE bytes of signature S");
+                sigs_bytes
+            }
+            None => [0u8; 32],
+        };
+
+        let mut sigs_repr = <E::Fr as PrimeField>::Repr::from(0);
+        sigs_repr
+            .read_le(&sigs_bytes[..])
+            .expect("interpret S as field element representation");
+
+        let sigs_converted = E::Fr::from_repr(sigs_repr).unwrap();
+
+        let s = num::AllocatedNum::alloc(cs.namespace(|| "allocate s"), || {
+            Ok(sigs_converted)
+        })
+        .unwrap();
+
+        let public_generator = self
+            .params
+            .generator(FixedGenerators::SpendingKeyGenerator)
+            .clone();
+        let generator = ecc::EdwardsPoint::witness(
+            cs.namespace(|| "allocate public generator"),
+            Some(public_generator),
+            self.params,
+        )
+        .unwrap();
+        let r = ecc::EdwardsPoint::witness(
+            cs.namespace(|| "allocate r"),
+            Some(self.sig.r),
+            self.params,
+        )
+        .unwrap();
+
+        let pk = ecc::EdwardsPoint::witness(
+            cs.namespace(|| "allocate pk"),
+            self.sig_pub_key_pt,
+            self.params,
+        )
+        .unwrap();
+
         Ok(())
     }
 }
@@ -137,7 +199,7 @@ fn test_fe_circuit_bls12() {
         verify_proof,
     };
     use bellman::pairing::bls12_381::Bls12;
-    use rand::{Rand, SeedableRng, XorShiftRng};
+    use rand::{Rand, Rng, SeedableRng, XorShiftRng};
     use sapling_crypto::circuit::test::TestConstraintSystem;
     use sapling_crypto::jubjub::{
         fs::Fs, FixedGenerators, JubjubBls12, JubjubParams,
@@ -164,13 +226,36 @@ fn test_fe_circuit_bls12() {
         // xG + r(sG):
         let enc = xg.add(&rsg, curve_params);
 
-        let instance = DLSnark::<Bls12> {
+        let sk = eddsa::PrivateKey::<Bls12>(rng.gen());
+        let p_g = FixedGenerators::SpendingKeyGenerator;
+
+        let mut x_bytes = [0u8; 32];
+        x.into_repr()
+            .write_le(&mut x_bytes[..])
+            .expect("has serialized x");
+
+        let sig_pub_key = PublicKey::from_private(&sk, p_g, curve_params);
+        let sig_pub_key_pt = sig_pub_key.0;
+
+        let sig =
+            sk.sign_schnorr_blake2s(&x_bytes, &mut rng, p_g, curve_params);
+        assert!(sig_pub_key.verify_schnorr_blake2s(
+            &x_bytes,
+            &sig,
+            p_g,
+            curve_params
+        ));
+
+        let instance = FESnark::<Bls12> {
             params: curve_params,
             x: Some(x.clone()),
             r: Some(r.clone()),
             pub_key: Some(pub_key.clone()),
             enc_rand: Some(enc_rand.clone()),
             enc: Some(enc.clone()),
+            sig: Some(sig.clone()),
+            sig_pub_key: Some(sig_pub_key.clone()),
+            sig_pub_key_pt: Some(sig_pub_key_pt.clone()),
         };
         let (x, y) = enc_rand.into_xy();
         let (x1, y1) = enc.into_xy();
@@ -191,13 +276,16 @@ fn test_fe_circuit_bls12() {
     };
 
     let circuit_parameters = {
-        let empty_circuit = DLSnark::<Bls12> {
+        let empty_circuit = FESnark::<Bls12> {
             params: curve_params,
             x: None,
             r: None,
             pub_key: None,
             enc_rand: None,
             enc: None,
+            sig: None,
+            sig_pub_key: None,
+            sig_pub_key_pt: None,
         };
         generate_random_parameters(empty_circuit, &mut rng).unwrap()
     };

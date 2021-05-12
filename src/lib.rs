@@ -2,6 +2,7 @@
 
 mod attr;
 mod dl;
+mod fe;
 mod merkle;
 mod preimage;
 mod rln;
