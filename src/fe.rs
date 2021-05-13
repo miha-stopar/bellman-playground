@@ -4,9 +4,9 @@ use bellman::{Circuit, ConstraintSystem, SynthesisError};
 use sapling_crypto::jubjub::{
     edwards, FixedGenerators, JubjubEngine, PrimeOrder, Unknown,
 };
-use sapling_crypto::{alt_babyjubjub::JubjubParams, eddsa};
+use sapling_crypto::{alt_babyjubjub::JubjubParams, constants, eddsa};
 use sapling_crypto::{
-    circuit::{boolean, ecc, num},
+    circuit::{blake2s, boolean, ecc, num},
     eddsa::{PublicKey, Signature},
 };
 
@@ -17,8 +17,8 @@ pub struct FESnark<'a, E: JubjubEngine> {
     pub pub_key: Option<edwards::Point<E, PrimeOrder>>,
     pub enc_rand: Option<edwards::Point<E, PrimeOrder>>,
     pub enc: Option<edwards::Point<E, PrimeOrder>>,
-    pub sig: Option<Signature<E>>,
-    pub sig_pub_key: Option<PublicKey<E>>,
+    pub sig_r: Option<edwards::Point<E, Unknown>>,
+    pub sig_s: Option<E::Fs>,
     pub sig_pub_key_pt: Option<edwards::Point<E, Unknown>>,
 }
 
@@ -31,8 +31,8 @@ impl<'a, E: JubjubEngine + 'a> Clone for FESnark<'a, E> {
             pub_key: self.pub_key.clone(),   // sG
             enc_rand: self.enc_rand.clone(), // rG
             enc: self.enc.clone(),           // xG + r(sG)
-            sig: self.sig.clone(),
-            sig_pub_key: self.sig_pub_key.clone(),
+            sig_r: self.sig_r.clone(),
+            sig_s: self.sig_s.clone(),
             sig_pub_key_pt: self.sig_pub_key_pt.clone(),
         }
     }
@@ -139,11 +139,11 @@ impl<'a, E: JubjubEngine> Circuit<E> for FESnark<'a, E> {
             &boolean::Boolean::constant(true),
         )?;
 
+        /*
         let mut sigs_bytes = [0u8; 32];
-        let sigs_bytes = match self.sig {
+        let sigs_bytes = match self.sig_s {
             Some(ref value) => {
                 value
-                    .s
                     .into_repr()
                     .write_le(&mut sigs_bytes[..])
                     .expect("get LE bytes of signature S");
@@ -163,20 +163,38 @@ impl<'a, E: JubjubEngine> Circuit<E> for FESnark<'a, E> {
             Ok(sigs_converted)
         })
         .unwrap();
+        */
+
+        // TODO: Fs : Fr
+
+        // TODO check that s < Fs::Char
+        let scalar_bits = boolean::field_into_boolean_vec_le(
+            cs.namespace(|| "Get S bits"),
+            // s.get_value(),
+            self.sig_s,
+        )?;
 
         let public_generator = self
             .params
             .generator(FixedGenerators::SpendingKeyGenerator)
             .clone();
+
         let generator = ecc::EdwardsPoint::witness(
             cs.namespace(|| "allocate public generator"),
             Some(public_generator),
             self.params,
         )
         .unwrap();
+
+        let sb = generator.mul(
+            cs.namespace(|| "S*B computation"),
+            &scalar_bits,
+            self.params,
+        )?;
+
         let r = ecc::EdwardsPoint::witness(
             cs.namespace(|| "allocate r"),
-            Some(self.sig.r),
+            self.sig_r,
             self.params,
         )
         .unwrap();
@@ -187,6 +205,66 @@ impl<'a, E: JubjubEngine> Circuit<E> for FESnark<'a, E> {
             self.params,
         )
         .unwrap();
+
+        // h = Hash(R_X || message)
+
+        // only order of R is checked. Public key and generator can be guaranteed to be in proper group!
+        // by some other means for out particular case
+        r.assert_not_small_order(
+            cs.namespace(|| "R is in right order"),
+            &self.params,
+        )?;
+
+        let mut hash_bits: Vec<boolean::Boolean> = vec![];
+
+        let r_x_serialized = boolean::field_into_boolean_vec_le(
+            cs.namespace(|| "Serialize R_X"),
+            r.get_x().get_value(),
+        )?;
+
+        hash_bits.extend(r_x_serialized.into_iter());
+        hash_bits.resize(256, boolean::Boolean::Constant(false));
+
+        hash_bits.extend(c_x.iter().cloned());
+        hash_bits.resize(512, boolean::Boolean::Constant(false));
+
+        assert_eq!(hash_bits.len(), 512);
+
+        let h = blake2s::blake2s(
+            cs.namespace(|| "Calculate EdDSA hash"),
+            &hash_bits,
+            constants::MATTER_EDDSA_BLAKE2S_PERSONALIZATION,
+        )?;
+
+        let pk_mul_hash =
+            pk.mul(cs.namespace(|| "Calculate h*PK"), &h, self.params)?;
+
+        let rhs = pk_mul_hash.add(
+            cs.namespace(|| "Make signature RHS"),
+            &r,
+            self.params,
+        )?;
+
+        let rhs_x = rhs.get_x();
+        let rhs_y = rhs.get_y();
+
+        let sb_x = sb.get_x();
+        let sb_y = sb.get_y();
+
+        let one = CS::one();
+        cs.enforce(
+            || "check x coordinate of signature",
+            |lc| lc + rhs_x.get_variable(),
+            |lc| lc + one,
+            |lc| lc + sb_x.get_variable(),
+        );
+
+        cs.enforce(
+            || "check y coordinate of signature",
+            |lc| lc + rhs_y.get_variable(),
+            |lc| lc + one,
+            |lc| lc + sb_y.get_variable(),
+        );
 
         Ok(())
     }
@@ -239,12 +317,14 @@ fn test_fe_circuit_bls12() {
 
         let sig =
             sk.sign_schnorr_blake2s(&x_bytes, &mut rng, p_g, curve_params);
+        /*
         assert!(sig_pub_key.verify_schnorr_blake2s(
             &x_bytes,
             &sig,
             p_g,
             curve_params
         ));
+        */
 
         let instance = FESnark::<Bls12> {
             params: curve_params,
@@ -253,8 +333,8 @@ fn test_fe_circuit_bls12() {
             pub_key: Some(pub_key.clone()),
             enc_rand: Some(enc_rand.clone()),
             enc: Some(enc.clone()),
-            sig: Some(sig.clone()),
-            sig_pub_key: Some(sig_pub_key.clone()),
+            sig_r: Some(sig.r.clone()),
+            sig_s: Some(sig.s.clone()),
             sig_pub_key_pt: Some(sig_pub_key_pt.clone()),
         };
         let (x, y) = enc_rand.into_xy();
@@ -267,6 +347,7 @@ fn test_fe_circuit_bls12() {
         let circuit = circuit.clone();
 
         circuit.synthesize(&mut cs).expect("to be synthesized");
+        println!("{0}", cs.find_unconstrained());
         assert!(cs.find_unconstrained() == "");
 
         let unsatisfied = cs.which_is_unsatisfied();
@@ -283,8 +364,8 @@ fn test_fe_circuit_bls12() {
             pub_key: None,
             enc_rand: None,
             enc: None,
-            sig: None,
-            sig_pub_key: None,
+            sig_r: None,
+            sig_s: None,
             sig_pub_key_pt: None,
         };
         generate_random_parameters(empty_circuit, &mut rng).unwrap()
